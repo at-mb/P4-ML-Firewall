@@ -1,0 +1,30 @@
+# sweep.yaml — example config for sweep.py
+#
+# All paths support ~ expansion.
+# CLI flags override any key here.
+
+# --- Global ---
+duration_min: 6
+
+# Global benign pcap — overrides per-dir benign_pcap if set.
+# global_benign_pcap: ~/data/CIC-DDoS-2019-Benign.pcap
+
+# Set to true to skip offline training (models must already exist).
+# skip_training: false
+
+# Benign replay rates to sweep. 0 = attack-only.
+benign_pps: [100, 1000]
+
+# --- Training hyperparameters to sweep ---
+training:
+  packets_per_flow: [4, 8]
+  time_window: [2, 4]
+
+# --- Attack directories ---
+# Each entry is one training domain. All .pcap files in the folder
+# (excluding the benign_pcap) are used for training and replayed individually
+# during live evaluation.
+attack_dirs:
+  - path: ~/p4ddle/p4-ddos/sample-dataset/
+    dataset_type: DOS2019
+    benign_pcap: ~/p4ddle/p4-ddos/sample-dataset/CIC-DDoS-2019-Benign.pcap

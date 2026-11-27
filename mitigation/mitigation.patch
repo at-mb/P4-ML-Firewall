@@ -1,0 +1,285 @@
+diff --git a/control-plane/lucid_cnn.py b/control-plane/lucid_cnn.py
+index e9fc354..b53b3c8 100644
+--- a/control-plane/lucid_cnn.py
++++ b/control-plane/lucid_cnn.py
+@@ -27,6 +27,8 @@ import random as rn
+ import os
+ from util_functions import *
+ import p4_util
++import mitigation
++import signal
+ 
+ # Seed Random Numbers
+ os.environ['PYTHONHASHSEED']=str(SEED)
+@@ -307,6 +309,15 @@ def main(argv):
+     parser.add_argument('-y', '--dataset_type', default=None, type=str,
+                         help='Type of the dataset. Available options are: IDS2017, IDS2018, SYN2020')
+ 
++    parser.add_argument('--mitigate', type=str, choices=['off', 'src', '5tuple'], default='off',
++                        help='Install drop rules on the switch for flows classified as malicious')
++
++    parser.add_argument('--block_timeout', type=float, default=60.0,
++                        help='Lifetime of a drop rule in seconds')
++
++    parser.add_argument('--protect', nargs='*', type=str, default=[],
++                        help='Networks that must never be blocked (CIDR)')
++
+     args = parser.parse_args()
+ 
+     if args.train is not None:
+@@ -462,6 +473,16 @@ def main(argv):
+ 
+         mins, maxs = static_min_max(p4_compatible,time_window)
+ 
++        mitigator = None
++        if args.mitigate != 'off':
++            if not isinstance(traffic_source, p4_util.RuntimeAPI):
++                print("--mitigate requires a P4 switch as traffic source!")
++                sys.exit(-1)
++            mitigator = mitigation.Mitigator(mitigation.SwitchTables(traffic_source.client), args.mitigate,
++                                             args.block_timeout, args.protect, './log/mitigation-' + log_time + '.csv')
++            # `timeout` stops the predictor with SIGTERM: treat it like Ctrl+C
++            signal.signal(signal.SIGTERM, signal.default_int_handler)
++
+         stoping_time = 0
+         last_collect_time = 0
+ 
+@@ -494,6 +515,8 @@ def main(argv):
+                         Y_pred = np.squeeze(model.predict(X, batch_size=2048) > 0.5,axis=1)
+                         pt1 = time.time()
+                         prediction_time = pt1 - pt0
++                        if mitigator is not None:
++                            mitigator.update(keys, Y_pred)
+                         [packets] = count_packets_in_dataset([X])
+ 
+                         if isinstance(traffic_source, p4_util.RuntimeAPI):
+@@ -505,11 +528,15 @@ def main(argv):
+                             if isinstance(traffic_source, pyshark.FileCapture):
+                                 if last_round:
+                                     sys.exit(0)
+-        
++
+                         last_collect_time = round_time
++                    elif mitigator is not None:
++                        mitigator.update()  # empty round: only expire old rules
+ 
+         except KeyboardInterrupt:
+             print("Ctrl+C pressed. Exiting gracefully.")
++            if mitigator is not None:
++                mitigator.close()
+             sys.exit(0)
+ 
+ def report_results(Y_true, Y_pred,packets, model_name, dataset_filename, stats_file,prediction_time,process_time=0, 
+diff --git a/control-plane/lucid_dataset_parser.py b/control-plane/lucid_dataset_parser.py
+index 7fc8652..49a0a84 100644
+--- a/control-plane/lucid_dataset_parser.py
++++ b/control-plane/lucid_dataset_parser.py
+@@ -327,7 +327,7 @@ def process_live_traffic(traffic_source, dataset_type, in_labels, max_flow_len,
+         if switch_impl == "p4ddle":
+             return labelled_flows, processing, extraction, packets_per_sample_sizes, process_in_memory, total_incoming_packets, ignored_by_fulled_bloom, round_time, round_counter
+         else:
+-            return labelled_flows, processing, extraction, packets_per_sample_sizes, process_in_memory, total_incoming_packets, round_time, round_counter
++            return labelled_flows, processing, extraction, packets_per_sample_sizes, process_in_memory, total_incoming_packets, 0, round_time, round_counter
+ 
+ def store_packet(pf,temp_dict,start_time_window, max_flow_len):
+     if pf is not None:
+diff --git a/control-plane/mitigation.py b/control-plane/mitigation.py
+new file mode 100644
+index 0000000..b8153cd
+--- /dev/null
++++ b/control-plane/mitigation.py
+@@ -0,0 +1,110 @@
++"""Naive mitigation loop: turns LUCID's predictions into drop rules on the switch.
++
++mode 'src'    : one rule per attacking source IP        (table MyIngress.blocked_src)
++mode '5tuple' : one rule per attacking flow direction   (table MyIngress.blocked_flows)
++
++Rules are removed after `timeout` seconds. Addresses in `protect` are never blocked:
++a flow's "source" is only the first endpoint seen in a round, so it can be the victim.
++"""
++import csv
++import ipaddress
++import time
++
++TABLES = {'src': 'MyIngress.blocked_src', '5tuple': 'MyIngress.blocked_flows'}
++ACTION = 'MyIngress.drop'
++
++
++def _ip(addr):
++    return ipaddress.IPv4Address(addr).packed
++
++
++class SwitchTables:
++    """Thin wrapper around the BMv2 Thrift client (runtime_api.client)."""
++
++    def __init__(self, client):
++        # imported here so that this module can be unit-tested without BMv2
++        from bm_runtime.standard import ttypes
++        self.client, self.t = client, ttypes
++
++    def add(self, table, fields):
++        match = [self.t.BmMatchParam(type=self.t.BmMatchParamType.EXACT,
++                                     exact=self.t.BmMatchParamExact(f)) for f in fields]
++        return self.client.bm_mt_add_entry(0, table, match, ACTION, [],
++                                           self.t.BmAddEntryOptions(priority=0))
++
++    def delete(self, table, handle):
++        self.client.bm_mt_delete_entry(0, table, handle)
++
++    def dropped(self, table, handle):
++        return self.client.bm_mt_read_counter(0, table, handle).packets
++
++
++class Mitigator:
++    def __init__(self, tables, mode, timeout=60.0, protect=(), log_path=None, clock=time.time):
++        self.tables, self.mode, self.table = tables, mode, TABLES[mode]
++        self.timeout, self.clock = timeout, clock
++        self.protect = [ipaddress.IPv4Network(p) for p in protect]
++        self.rules = {}  # rule key -> (handle, install time)
++        self.file = open(log_path, 'w', newline='') if log_path else None
++        self.log = csv.writer(self.file) if self.file else None
++        self._write('time', 'event', 'rule', 'dropped_packets', 'active_rules')
++
++    def _write(self, *row):
++        if self.log:
++            self.log.writerow(row)
++            self.file.flush()
++
++    def _protected(self, addr):
++        return any(ipaddress.IPv4Address(addr) in n for n in self.protect)
++
++    def _rule(self, flow):
++        """Rule key for a flagged flow, oriented attacker -> victim, or None."""
++        src, sport, dst, dport, proto = flow
++        if self._protected(src):
++            if self._protected(dst):
++                return None
++            src, sport, dst, dport = dst, dport, src, sport
++        return (src,) if self.mode == 'src' else (src, sport, dst, dport, proto)
++
++    @staticmethod
++    def _encode(rule):
++        if len(rule) == 1:
++            return [_ip(rule[0])]
++        src, sport, dst, dport, proto = rule
++        return [_ip(src), int(sport).to_bytes(2, 'big'), _ip(dst),
++                int(dport).to_bytes(2, 'big'), int(proto).to_bytes(1, 'big')]
++
++    def update(self, flows=(), predictions=()):
++        """Call once per round, also when the round is empty (to expire rules)."""
++        now = self.clock()
++        for rule, (handle, t0) in list(self.rules.items()):
++            if now - t0 >= self.timeout:
++                self._remove(rule, handle, now, 'expire')
++        for flow, malicious in zip(flows, predictions):
++            rule = self._rule(flow) if malicious else None
++            if rule is None or rule in self.rules:
++                continue
++            try:
++                handle = self.tables.add(self.table, self._encode(rule))
++            except Exception as e:  # e.g. table full: keep detecting
++                self._write(now, 'error', rule, repr(e), len(self.rules))
++                continue
++            self.rules[rule] = (handle, now)
++            self._write(now, 'block', rule, 0, len(self.rules))
++
++    def _remove(self, rule, handle, now, event):
++        dropped = -1
++        try:
++            dropped = self.tables.dropped(self.table, handle)
++            self.tables.delete(self.table, handle)
++        except Exception as e:
++            self._write(now, 'error', rule, repr(e), len(self.rules))
++            return
++        del self.rules[rule]
++        self._write(now, event, rule, dropped, len(self.rules))
++
++    def close(self):
++        """Remove every rule and log how many packets each one dropped."""
++        now = self.clock()
++        for rule, (handle, _) in list(self.rules.items()):
++            self._remove(rule, handle, now, 'close')
+diff --git a/control-plane/p4_util.py b/control-plane/p4_util.py
+index b4fdb15..25958dd 100644
+--- a/control-plane/p4_util.py
++++ b/control-plane/p4_util.py
+@@ -20,6 +20,7 @@ LUCID_REGISTERS = ['time','packet_length','ip_flags', 'tcp_len', 'tcp_ack', 'tcp
+ PACKET_COUNTER = 'packet_counter'
+ SAMPLING_COUNTER='sampling_counter'
+ BLOCK_OF_REGISTERS='block_of_registers'
++BLOOM_FILTER='flow_counter'
+ ROUND_COUNTER='round_counter'
+ 
+ class RuntimeAPI():
+@@ -116,6 +117,9 @@ class RuntimeAPI():
+             for feature in self.features:
+                 self.reset_register(feature+str(block))
+             self.reset_register(PACKET_COUNTER+str(block))
++            # the filter must be cleared every round, as described in the P4DDLe paper
++            if BLOOM_FILTER+str(block) in self.device_config["register"]: # absent in baseline
++                self.reset_register(BLOOM_FILTER+str(block))
+         else:
+             self.reset_register(SAMPLING_COUNTER)
+             for feature in self.features:
+diff --git a/data-plane/p4ddle/p4_bloom_management.p4 b/data-plane/p4ddle/p4_bloom_management.p4
+index 2b7e6ad..738fdd6 100755
+--- a/data-plane/p4ddle/p4_bloom_management.p4
++++ b/data-plane/p4ddle/p4_bloom_management.p4
+@@ -47,6 +47,32 @@ control MyIngress(inout headers hdr,
+         default_action = NoAction();
+     }
+     
++    // ---- mitigation: drop rules installed by the control plane ----
++    direct_counter(CounterType.packets) blocked_src_counter;
++    direct_counter(CounterType.packets) blocked_flows_counter;
++
++    table blocked_src {
++        key = { meta.srcAddr: exact; }
++        actions = { drop; NoAction; }
++        size = 1024;
++        default_action = NoAction();
++        counters = blocked_src_counter;
++    }
++
++    table blocked_flows {
++        key = {
++            meta.srcAddr:    exact;
++            meta.srcPort:    exact;
++            meta.dstAddr:    exact;
++            meta.dstPort:    exact;
++            meta.ipProtocol: exact;
++        }
++        actions = { drop; NoAction; }
++        size = 16384;
++        default_action = NoAction();
++        counters = blocked_flows_counter;
++    }
++
+     apply {
+         
+         bit<1> block_new_features;
+@@ -69,7 +95,23 @@ control MyIngress(inout headers hdr,
+ 
+         if (hdr.ipv4.isValid()) {
+             
+-            change_switch_output_port.apply(); // apply "learning bridge"         
++            // Blocked traffic is neither forwarded nor stored. Returning here matters:
++            // set_output_port after mark_to_drop would cancel the drop.
++            if (blocked_src.apply().hit) {
++                return;
++            }
++            if (blocked_flows.apply().hit) {
++                return;
++            }
++
++            // Replayed datasets carry foreign MACs: fall back to port 1 <-> port 2.
++            if (!change_switch_output_port.apply().hit) {
++                if (standard_metadata.ingress_port == 1) {
++                    standard_metadata.egress_spec = 2;
++                } else {
++                    standard_metadata.egress_spec = 1;
++                }
++            }
+ 
+         sampling_treshold.read(sampling_treshold_value,0);
+         sampling_counter.read(sampling_counter_value,0);

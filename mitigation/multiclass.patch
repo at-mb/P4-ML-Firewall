@@ -1,0 +1,618 @@
+diff --git a/control-plane/lucid_cnn.py b/control-plane/lucid_cnn.py
+index b53b3c8..fcdd63a 100644
+--- a/control-plane/lucid_cnn.py
++++ b/control-plane/lucid_cnn.py
+@@ -70,7 +70,52 @@ LR = [0.1,0.01]
+ BATCH_SIZE = [1024,2048]
+ KERNELS = [32,64]
+ 
+-def Conv2DModel(model_name, input_shape,kernels,kernel_rows,kernel_col,pool_height='max', regularization=None,dropout=None):
++# ---- multi-class extension ----
++def dataset_attrs(path):
++    """(class names or None, feature set) stored by lucid_dataset_parser in an hdf5 file"""
++    with h5py.File(glob.glob(path)[0], "r") as f:
++        classes = f.attrs.get('classes', None)
++        feature_set = f.attrs.get('feature_set', 'lucid')
++    if isinstance(classes, bytes):
++        classes = classes.decode()
++    if isinstance(feature_set, bytes):
++        feature_set = feature_set.decode()
++    return (classes.split(',') if classes else None), feature_set
++
++def classes_file(model_path):
++    return model_path[:-len('.h5')] + '-classes.csv'
++
++def model_classes(model_path, model):
++    """Class names of a model: read from <model>-classes.csv, saved next to the .h5"""
++    n_outputs = model.output_shape[-1]
++    if n_outputs == 1:
++        return ['benign', 'ddos']
++    try:
++        with open(classes_file(model_path)) as f:
++            names = [row[1] for row in csv.reader(f) if row and row[0].isdigit()]
++        if len(names) == n_outputs:
++            return names
++    except OSError:
++        pass
++    return ['benign'] + ['class' + str(i) for i in range(1, n_outputs)]
++
++def predict_classes(model, X):
++    """Class index per sample (0 = benign), for both binary and multi-class models"""
++    p = model.predict(X, batch_size=2048, verbose=0)
++    if p.shape[1] == 1:
++        return (p[:, 0] > 0.5).astype(int)
++    return np.argmax(p, axis=1)
++
++def class_report(Y_true, Y_pred, names):
++    labels = list(range(len(names)))
++    report = classification_report(Y_true, Y_pred, labels=labels, target_names=names, digits=4, zero_division=0)
++    matrix = confusion_matrix(Y_true, Y_pred, labels=labels)
++    lines = ["Confusion matrix (rows = true class, columns = predicted class)",
++             " " * 10 + "".join(n[:9].rjust(10) for n in names)]
++    lines += [n[:9].ljust(10) + "".join(str(v).rjust(10) for v in row) for n, row in zip(names, matrix)]
++    return report + "\n" + "\n".join(lines) + "\n"
++
++def Conv2DModel(model_name, input_shape,kernels,kernel_rows,kernel_col,pool_height='max', regularization=None,dropout=None,n_classes=2):
+     K.clear_session()
+ 
+     model = Sequential(name=model_name)
+@@ -99,19 +144,23 @@ def Conv2DModel(model_name, input_shape,kernels,kernel_rows,kernel_col,pool_heig
+     pool_size = (min(pool_height, current_rows), min(3, current_cols))
+     model.add(MaxPooling2D(pool_size=pool_size, name='mp0'))
+     model.add(Flatten())
+-    model.add(Dense(1, activation='sigmoid', name='fc1'))
++    if n_classes > 2:
++        model.add(Dense(n_classes, activation='softmax', name='fc1'))
++    else:
++        model.add(Dense(1, activation='sigmoid', name='fc1'))
+ 
+     print(model.summary())
+     return model
+ 
+-def compileModel(model,lr):
++def compileModel(model,lr,n_classes=2):
+     # optimizer = SGD(lr=lr, momentum=0.0, decay=0.0, nesterov=False)
+     optimizer = Adam(lr=lr, beta_1=0.9, beta_2=0.999, epsilon=None, decay=0.0, amsgrad=False)
+-    model.compile(loss='binary_crossentropy', optimizer=optimizer,metrics=['accuracy'])  # here we specify the loss function
++    loss = 'sparse_categorical_crossentropy' if n_classes > 2 else 'binary_crossentropy'
++    model.compile(loss=loss, optimizer=optimizer,metrics=['accuracy'])  # here we specify the loss function
+ 
+-def trainingEpoch(model, batch_size, parameters, X_train,Y_train,X_val,Y_val, output_file):
++def trainingEpoch(model, batch_size, parameters, X_train,Y_train,X_val,Y_val, output_file, class_weight=None):
+     tt0 = time.time()
+-    history = model.fit(x=X_train, y=Y_train, validation_data=(X_val, Y_val), epochs=1, batch_size=batch_size, verbose=2, callbacks=[])  # TODO: verify which callbacks can be useful here (https://keras.io/callbacks/)
++    history = model.fit(x=X_train, y=Y_train, validation_data=(X_val, Y_val), epochs=1, batch_size=batch_size, verbose=2, callbacks=[], class_weight=class_weight)  # TODO: verify which callbacks can be useful here (https://keras.io/callbacks/)
+     tt1 = time.time()
+ 
+     accuracy_train = history.history['accuracy'][0]
+@@ -133,8 +182,13 @@ def trainingEpoch(model, batch_size, parameters, X_train,Y_train,X_val,Y_val, ou
+ 
+     return loss_val, accuracy_val
+ 
+-def trainCNNModels(model_name, epochs, X_train, Y_train,X_val, Y_val, dataset_folder, time_window, max_flow_len,regularization=None, dropout=None):
++def trainCNNModels(model_name, epochs, X_train, Y_train,X_val, Y_val, dataset_folder, time_window, max_flow_len,regularization=None, dropout=None, classes=None):
+ 
++    n_classes = len(classes) if classes else 2
++    class_weight = None
++    if n_classes > 2: # inverse class frequency, so that small attack classes are not ignored
++        counts = np.bincount(Y_train.astype(int), minlength=n_classes)
++        class_weight = {i: len(Y_train) / (n_classes * max(c, 1)) for i, c in enumerate(counts)}
+     packets = X_train.shape[1]
+     features = X_train.shape[2]
+     best_f1_score = 0
+@@ -158,15 +212,15 @@ def trainCNNModels(model_name, epochs, X_train, Y_train,X_val, Y_val, dataset_fo
+                             min_loss = float('inf')
+                             max_acc_val = 0
+                             parameters = "lr=" + '{:04.3f}'.format(lr) + ",b=" + '{:04d}'.format(batch_size) + ",n=" + '{:03d}'.format(max_flow_len) + ",t=" + '{:03d}'.format(time_window) + ",k=" + '{:03d}'.format(kernels) + ",h=(" + '{:02d}'.format(kernel_rows) + "," + '{:02d}'.format(kernel_columns) + "),m=" + pool_height
+-                            model = Conv2DModel(model_name, X_train.shape[1:4], kernels, kernel_rows, kernel_columns,pool_height,regularization,dropout)
+-                            compileModel(model,lr)
++                            model = Conv2DModel(model_name, X_train.shape[1:4], kernels, kernel_rows, kernel_columns,pool_height,regularization,dropout,n_classes)
++                            compileModel(model,lr,n_classes)
+                             best_model = None
+                             best_model_loss_val = float('inf')
+                             epoch_counter = 0
+                             for epoch in epochs_range:
+                                 print("Epoch: %d/%s" % (epoch_counter + 1, str(epochs)))
+                                 epoch_counter += 1
+-                                loss_val, acc_val= trainingEpoch(model, batch_size, parameters, X_train, Y_train, X_val, Y_val, stats_file)
++                                loss_val, acc_val= trainingEpoch(model, batch_size, parameters, X_train, Y_train, X_val, Y_val, stats_file, class_weight)
+ 
+                                 if acc_val > max_acc_val:
+                                     max_acc_val = acc_val
+@@ -183,12 +237,17 @@ def trainCNNModels(model_name, epochs, X_train, Y_train,X_val, Y_val, dataset_fo
+                                 if stop_counter > MAX_CONSECUTIVE_LOSS_INCREASE or max_acc_val == 1 or epoch+1 == epochs: # early stopping management
+                                     if best_model is not None:
+                                         tp0 = time.time()
+-                                        Y_pred_val = (best_model.predict(X_val) > 0.5)
++                                        Y_class_val = predict_classes(best_model, X_val)
+                                         tp1 = time.time()
+-                                        Y_true_val = Y_val.reshape((Y_val.shape[0], 1))
+-                                        acc_score_val = accuracy_score(Y_true_val, Y_pred_val)
+-                                        ppv_score_val = precision_score(Y_true_val, Y_pred_val)
+-                                        f1_score_val = f1_score(Y_true_val, Y_pred_val)
++                                        # PPV/TPR/FPR/... always refer to attack (any class > 0) vs benign
++                                        Y_pred_val = (Y_class_val > 0).reshape((-1, 1))
++                                        Y_true_val = (Y_val > 0).reshape((Y_val.shape[0], 1))
++                                        acc_score_val = accuracy_score(Y_val, Y_class_val)
++                                        ppv_score_val = precision_score(Y_true_val, Y_pred_val, zero_division=0)
++                                        if n_classes > 2: # model selection uses the macro F1 over all classes
++                                            f1_score_val = f1_score(Y_val, Y_class_val, average='macro', labels=list(range(n_classes)), zero_division=0)
++                                        else:
++                                            f1_score_val = f1_score(Y_true_val, Y_pred_val)
+                                         tn, fp, fn, tp = confusion_matrix(Y_true_val, Y_pred_val, labels=[0, 1]).ravel()
+                                         tnr_score_val = tn / (tn + fp)
+                                         fpr_score_val = fp / (fp + tn)
+@@ -217,6 +276,12 @@ def trainCNNModels(model_name, epochs, X_train, Y_train,X_val, Y_val, dataset_fo
+                                                 model_stats_file.write(output_string)
+                                                 model_stats_file.flush()
+                                                 model_stats_file.close()
++                                                if n_classes > 2:
++                                                    per_class = f1_score(Y_val, Y_class_val, average=None, labels=list(range(n_classes)), zero_division=0)
++                                                    with open(classes_file(filename + '.h5'), 'w') as cf:
++                                                        cf.write("index,class,validation_f1\n")
++                                                        for i, name in enumerate(classes):
++                                                            cf.write("%d,%s,%.4f\n" % (i, name, per_class[i]))
+                                                 best_f1_score = f1_score_val
+                                             except:
+                                                 print("An exception occurred when saving the model!")
+@@ -315,6 +380,9 @@ def main(argv):
+     parser.add_argument('--block_timeout', type=float, default=60.0,
+                         help='Lifetime of a drop rule in seconds')
+ 
++    parser.add_argument('--min_flows', type=int, default=1,
++                        help='Block a source only if at least this many of its flows are flagged in one round')
++
+     parser.add_argument('--protect', nargs='*', type=str, default=[],
+                         help='Networks that must never be blocked (CIDR)')
+ 
+@@ -346,7 +414,10 @@ def main(argv):
+ 
+             print ("\nCurrent dataset folder: ", dataset_folder)
+ 
+-            trainCNNModels(dataset_name + "-LUCID" + p4, args.epochs,X_train,Y_train,X_val,Y_val,dataset_folder, time_window, max_flow_len, args.regularization, args.dropout)
++            classes, feature_set = dataset_attrs(dataset_folder + "/*" + '-train.hdf5')
++            if classes:
++                print("Multi-class training:", ", ".join(classes), "| features:", feature_set)
++            trainCNNModels(dataset_name + "-LUCID" + p4, args.epochs,X_train,Y_train,X_val,Y_val,dataset_folder, time_window, max_flow_len, args.regularization, args.dropout, classes)
+ 
+ 
+     if args.predict is not None:
+@@ -371,13 +442,14 @@ def main(argv):
+             filename_prefix = model_filename.split('-')[0].strip() + '-' + model_filename.split('-')[1].strip() + '-'
+             model_name_string = model_filename.split(filename_prefix)[1].strip().split('.')[0].strip()
+             model = load_model(model_path)
++            names = model_classes(model_path, model)
+ 
+             # warming up the model (necessary for the GPU)
+             warm_up_file = dataset_filelist[0]
+             filename = warm_up_file.split('/')[-1].strip()
+             if filename_prefix in filename:
+                 X, Y = load_dataset(warm_up_file)
+-                Y_pred = np.squeeze(model.predict(X, batch_size=2048) > 0.5)
++                Y_pred = predict_classes(model, X)
+ 
+             for dataset_file in dataset_filelist:
+                 filename = dataset_file.split('/')[-1].strip()
+@@ -390,13 +462,19 @@ def main(argv):
+                     avg_time = 0
+                     for iteration in range(iterations):
+                         pt0 = time.time()
+-                        Y_pred = np.squeeze(model.predict(X, batch_size=2048) > 0.5)
++                        Y_pred = predict_classes(model, X)
+                         pt1 = time.time()
+                         avg_time += pt1 - pt0
+ 
+                     avg_time = avg_time / iterations
+ 
+-                    report_results(np.squeeze(Y_true), Y_pred, packets, model_name_string, filename, stats_file, avg_time, short_header=True)
++                    if len(names) > 2:
++                        report = class_report(np.squeeze(Y_true).astype(int), Y_pred, names)
++                        print(report)
++                        with open('./log/classes-' + time.strftime("%Y%m%d-%H%M%S") + '-' + filename.replace('.hdf5', '.txt'), 'w') as f:
++                            f.write(model_path + "\n" + dataset_file + "\n\n" + report)
++                    # the standard LUCID metrics are computed on attack (any class) vs benign
++                    report_results(np.squeeze(Y_true) > 0, Y_pred > 0, packets, model_name_string, filename, stats_file, avg_time, short_header=True)
+ 
+     if args.predict_live is not None:
+ 
+@@ -472,6 +550,13 @@ def main(argv):
+         p4_compatible = True if model_filename.find('p4') > 0 else False
+ 
+         mins, maxs = static_min_max(p4_compatible,time_window)
++        names = model_classes(model_path, model)
++        feature_set = 'rich' if model.input_shape[2] == RICH_FEATURES else 'lucid'
++        class_writer = None
++        if len(names) > 2:
++            class_file = open('./log/classes-' + log_time + '.csv', 'w', newline='')
++            class_writer = csv.writer(class_file)
++            class_writer.writerow(['round_counter', 'round_time'] + names)
+ 
+         mitigator = None
+         if args.mitigate != 'off':
+@@ -479,7 +564,8 @@ def main(argv):
+                 print("--mitigate requires a P4 switch as traffic source!")
+                 sys.exit(-1)
+             mitigator = mitigation.Mitigator(mitigation.SwitchTables(traffic_source.client), args.mitigate,
+-                                             args.block_timeout, args.protect, './log/mitigation-' + log_time + '.csv')
++                                             args.block_timeout, args.protect, './log/mitigation-' + log_time + '.csv',
++                                             min_flows=args.min_flows)
+             # `timeout` stops the predictor with SIGTERM: treat it like Ctrl+C
+             signal.signal(signal.SIGTERM, signal.default_int_handler)
+ 
+@@ -503,7 +589,7 @@ def main(argv):
+                     last_collect_time = round_time
+                     if len(samples) > 0:
+                         X,Y_true,keys = dataset_to_list_of_fragments(samples)
+-                        X = np.array(normalize_and_padding(X, mins, maxs, max_flow_len))
++                        X = np.array(normalize_and_padding(X, mins, maxs, max_flow_len, feature_set=feature_set, time_window=time_window))
+ 
+                         if labels is not None:
+                             Y_true = np.array(Y_true)
+@@ -512,11 +598,16 @@ def main(argv):
+ 
+                         X = np.expand_dims(X, axis=3)
+                         pt0 = time.time()
+-                        Y_pred = np.squeeze(model.predict(X, batch_size=2048) > 0.5,axis=1)
++                        Y_class = predict_classes(model, X)
++                        Y_pred = Y_class > 0  # attack of any type
+                         pt1 = time.time()
+                         prediction_time = pt1 - pt0
+                         if mitigator is not None:
+-                            mitigator.update(keys, Y_pred)
++                            mitigator.update(keys, Y_pred, [names[c] for c in Y_class])
++                        if class_writer is not None:
++                            counts = np.bincount(Y_class, minlength=len(names))
++                            class_writer.writerow([round_counter if isinstance(traffic_source, p4_util.RuntimeAPI) else '', '%.4f' % round_time] + list(counts))
++                            class_file.flush()
+                         [packets] = count_packets_in_dataset([X])
+ 
+                         if isinstance(traffic_source, p4_util.RuntimeAPI):
+diff --git a/control-plane/lucid_dataset_parser.py b/control-plane/lucid_dataset_parser.py
+index 49a0a84..8ad51df 100644
+--- a/control-plane/lucid_dataset_parser.py
++++ b/control-plane/lucid_dataset_parser.py
+@@ -56,9 +56,32 @@ DDOS_ATTACK_SPECS = {
+     'IDS2017' : IDS2017_DDOS_FLOWS,
+     'IDS2018' : IDS2018_DDOS_FLOWS,
+     'SYN2020' : CUSTOM_DDOS_SYN,
+-    'DOS2019': DOS2019_FLOWS
++    'DOS2019': DOS2019_FLOWS,
++    'DOS2019_MC': DOS2019_FLOWS
+ }
+ 
++# Multi-class extension. Attack flows (found with DDOS_ATTACK_SPECS) get the class whose
++# keyword appears in the pcap filename. Class 0 is always benign.
++ATTACK_CLASSES = {
++    'DOS2019_MC': OrderedDict([('dns', 'dns'), ('synflood', 'syn'), ('udplag', 'udplag'), ('webddos', 'webddos')])
++}
++CLASSES_FILE = 'classes.txt'
++
++def class_names(dataset_type):
++    if dataset_type not in ATTACK_CLASSES:
++        return None
++    return ['benign'] + list(ATTACK_CLASSES[dataset_type].keys())
++
++def pcap_class(pcap_file, dataset_type):
++    """Label given to the attack flows of this pcap (1 for binary datasets)."""
++    if dataset_type not in ATTACK_CLASSES:
++        return 1
++    name = os.path.basename(pcap_file).lower()
++    for i, keyword in enumerate(ATTACK_CLASSES[dataset_type].values()):
++        if keyword in name:
++            return i + 1
++    return None # benign-only pcap: attack flows found here would be an error
++
+ vector_proto = CountVectorizer()
+ vector_proto.fit_transform(protocols).todense()
+ 
+@@ -193,7 +216,8 @@ def process_pcap(pcap_file,dataset_type,in_labels,max_flow_len,labelled_flows, p
+ 
+     pcap_name = pcap_file.split("/")[-1]
+     print("Processing file: ", pcap_name)
+-    cap = pyshark.FileCapture(pcap_file)
++    # No IP reassembly: the switch sees every fragment, and so must the training data
++    cap = pyshark.FileCapture(pcap_file, override_prefs={'ip.defragment': 'FALSE'})
+     for i, pkt in enumerate(cap):
+         if i % 1000 == 0:
+             print(pcap_name + " packet #", i)
+@@ -205,7 +229,8 @@ def process_pcap(pcap_file,dataset_type,in_labels,max_flow_len,labelled_flows, p
+         pf = parse_packet(pkt, p4_compatible)
+         temp_dict = store_packet(pf, temp_dict, start_time_window, max_flow_len)
+     
+-    apply_labels(temp_dict, labelled_flows, in_labels, traffic_type)
++    attack_label = pcap_class(pcap_file, dataset_type)
++    apply_labels(temp_dict, labelled_flows, in_labels, traffic_type, attack_label)
+     
+     print('Completed file {} in {} seconds.'.format(pcap_name, time.time() - start_time))
+ 
+@@ -348,11 +373,15 @@ def store_packet(pf,temp_dict,start_time_window, max_flow_len):
+                 temp_dict[pf.id_bwd][start_time_window] = np.array([pf.features_list])
+     return temp_dict
+ 
+-def apply_labels(flows, labelled_flows, labels, traffic_type):
++def apply_labels(flows, labelled_flows, labels, traffic_type, attack_label=1):
+     for five_tuple, flow in flows.items():
+         if labels is not None:
+             short_key = (five_tuple[0], five_tuple[2])  # for IDS2017/IDS2018 dataset the labels have shorter keys
+             flow['label'] = labels.get(short_key, 0)
++            if flow['label'] > 0:
++                if attack_label is None:
++                    raise ValueError("attack flow %s in a pcap whose name matches no attack class" % (five_tuple,))
++                flow['label'] = attack_label
+ 
+         for flow_key, packet_list in flow.items():
+             # relative time wrt the time of the first packet in the flow
+@@ -382,8 +411,29 @@ def count_flows(preprocessed_flows):
+ 
+     return (total_flows, ddos_flows, total_flows - ddos_flows), (total_fragments, ddos_fragments, total_fragments-ddos_fragments)
+ 
++# multi-class: every class is capped at the number of benign fragments (and at total/n_classes);
++# the remaining imbalance is handled with class weights during training
++def balance_dataset_multiclass(flows, total_fragments=float('inf')):
++    fragments = Counter()
++    for flow in flows:
++        fragments[flow[1]['label']] += len(flow[1]) - 1
++    cap = min(total_fragments / len(fragments), fragments[0] if fragments[0] > 0 else float('inf'))
++
++    random.shuffle(flows)
++    kept = Counter()
++    new_flow_list = []
++    for flow in flows:
++        label = flow[1]['label']
++        if kept[label] < cap:
++            kept[label] += len(flow[1]) - 1
++            new_flow_list.append(flow)
++    ddos_fragments = sum(v for k, v in kept.items() if k > 0)
++    return new_flow_list, kept[0], ddos_fragments
++
+ # balance the dataset based on the number of benign and malicious fragments of flows
+ def balance_dataset(flows,total_fragments=float('inf')):
++    if any(flow[1]['label'] > 1 for flow in flows):
++        return balance_dataset_multiclass(flows, total_fragments)
+     new_flow_list = []
+ 
+     _,(_, ddos_fragments, benign_fragments) = count_flows(flows)
+@@ -425,6 +475,11 @@ def dataset_to_list_of_fragments(dataset):
+ 
+     return X,y,keys
+ 
++def write_attrs(hf, classes, feature_set):
++    hf.attrs['feature_set'] = feature_set
++    if classes is not None:
++        hf.attrs['classes'] = ','.join(classes)
++
+ def train_test_split(flow_list,train_size=TRAIN_SIZE, shuffle=True):
+     test_list = []
+     _,(total_examples,_,_) = count_flows(flow_list)
+@@ -483,6 +538,9 @@ def main(argv):
+     parser.add_argument('--p4_compatible', action='store_true',
+                         help='Use only p4 compatible features: remove Highest Layer and Protocols')
+ 
++    parser.add_argument('--feature_set', choices=['lucid', 'rich'], default=None,
++                        help='Feature encoding (default: rich for multi-class datasets, lucid otherwise)')
++
+     args = parser.parse_args()
+ 
+     if args.packets_per_flow is not None:
+@@ -557,6 +615,10 @@ def main(argv):
+             # store the data as binary data stream
+             pickle.dump(preprocessed_flows, filehandle)
+ 
++        if class_names(args.dataset_type[0]) is not None:
++            with open(os.path.join(output_folder, CLASSES_FILE), 'w') as f:
++                f.write('\n'.join(class_names(args.dataset_type[0])) + '\n')
++
+ 
+         (total_flows, ddos_flows, benign_flows),  (total_fragments, ddos_fragments, benign_fragments) = count_flows(preprocessed_flows)
+ 
+@@ -615,6 +677,16 @@ def main(argv):
+                 preprocessed_flows = preprocessed_flows + pickle.load(filehandle)
+ 
+ 
++        classes = None
++        classes_file = os.path.join(os.path.dirname(os.path.realpath(filelist[0])), CLASSES_FILE) if filelist else None
++        if classes_file and os.path.isfile(classes_file):
++            with open(classes_file) as f:
++                classes = [line.strip() for line in f if line.strip()]
++        feature_set = args.feature_set or ('rich' if classes else 'lucid')
++        if feature_set == 'rich' and not p4_compatible:
++            print("The rich feature set requires --p4_compatible data!")
++            exit()
++
+         # balance samples and redux the number of samples when requested
+         preprocessed_flows, benign_fragments, ddos_fragments = balance_dataset(preprocessed_flows,args.samples)
+ 
+@@ -635,20 +707,21 @@ def main(argv):
+         mins,maxs = static_min_max(p4_compatible,time_window)
+ 
+         total_examples = len(y_full)
+-        total_ddos_examples = sum(y_full)
+-        total_benign_examples = len(y_full) - sum(y_full)
++        total_ddos_examples = sum(1 for y in y_full if y > 0)
++        total_benign_examples = len(y_full) - total_ddos_examples
+ 
+         if p4_compatible:
+             output_file = output_folder + '/' + str(time_window) + 't-' + str(max_flow_len) + 'n-' + dataset_id + '-dataset-p4'
+         else:
+             output_file = output_folder + '/' + str(time_window) + 't-' + str(max_flow_len) + 'n-' + dataset_id + '-dataset'
+         if args.no_split == True: # don't split the dataset
+-            norm_X_full = normalize_and_padding(X_full, mins, maxs, max_flow_len)
++            norm_X_full = normalize_and_padding(X_full, mins, maxs, max_flow_len, feature_set=feature_set, time_window=time_window)
+             #norm_X_full = padding(X_full,max_flow_len) # only padding
+             norm_X_full_np = np.array(norm_X_full)
+             y_full_np = np.array(y_full)
+ 
+             hf = h5py.File(output_file + '-full.hdf5', 'w')
++            write_attrs(hf, classes, feature_set)
+             hf.create_dataset('set_x', data=norm_X_full_np)
+             hf.create_dataset('set_y', data=y_full_np)
+             hf.close()
+@@ -658,9 +731,9 @@ def main(argv):
+                          ") | Total packets:(" + str(full_packets) + \
+                          ") | options:" + command_options + " |\n"
+         else:
+-            norm_X_train = normalize_and_padding(X_train,mins,maxs,max_flow_len)
+-            norm_X_val = normalize_and_padding(X_val, mins, maxs, max_flow_len)
+-            norm_X_test = normalize_and_padding(X_test, mins, maxs, max_flow_len)
++            norm_X_train = normalize_and_padding(X_train,mins,maxs,max_flow_len, feature_set=feature_set, time_window=time_window)
++            norm_X_val = normalize_and_padding(X_val, mins, maxs, max_flow_len, feature_set=feature_set, time_window=time_window)
++            norm_X_test = normalize_and_padding(X_test, mins, maxs, max_flow_len, feature_set=feature_set, time_window=time_window)
+ 
+             norm_X_train_np = np.array(norm_X_train)
+             y_train_np = np.array(y_train)
+@@ -670,16 +743,19 @@ def main(argv):
+             y_test_np = np.array(y_test)
+ 
+             hf = h5py.File(output_file + '-train.hdf5', 'w')
++            write_attrs(hf, classes, feature_set)
+             hf.create_dataset('set_x', data=norm_X_train_np)
+             hf.create_dataset('set_y', data=y_train_np)
+             hf.close()
+ 
+             hf = h5py.File(output_file + '-val.hdf5', 'w')
++            write_attrs(hf, classes, feature_set)
+             hf.create_dataset('set_x', data=norm_X_val_np)
+             hf.create_dataset('set_y', data=y_val_np)
+             hf.close()
+ 
+             hf = h5py.File(output_file + '-test.hdf5', 'w')
++            write_attrs(hf, classes, feature_set)
+             hf.create_dataset('set_x', data=norm_X_test_np)
+             hf.create_dataset('set_y', data=y_test_np)
+             hf.close()
+diff --git a/control-plane/mitigation.py b/control-plane/mitigation.py
+index b8153cd..767f8d7 100644
+--- a/control-plane/mitigation.py
++++ b/control-plane/mitigation.py
+@@ -3,7 +3,9 @@
+ mode 'src'    : one rule per attacking source IP        (table MyIngress.blocked_src)
+ mode '5tuple' : one rule per attacking flow direction   (table MyIngress.blocked_flows)
+ 
+-Rules are removed after `timeout` seconds. Addresses in `protect` are never blocked:
++Rules are removed after `timeout` seconds. With min_flows > 1, a source must have at least
++that many flows flagged in the same round before any rule is installed for it.
++ Addresses in `protect` are never blocked:
+ a flow's "source" is only the first endpoint seen in a round, so it can be the victim.
+ """
+ import csv
+@@ -40,14 +42,15 @@ class SwitchTables:
+ 
+ 
+ class Mitigator:
+-    def __init__(self, tables, mode, timeout=60.0, protect=(), log_path=None, clock=time.time):
++    def __init__(self, tables, mode, timeout=60.0, protect=(), log_path=None, clock=time.time, min_flows=1):
+         self.tables, self.mode, self.table = tables, mode, TABLES[mode]
++        self.min_flows = min_flows
+         self.timeout, self.clock = timeout, clock
+         self.protect = [ipaddress.IPv4Network(p) for p in protect]
+         self.rules = {}  # rule key -> (handle, install time)
+         self.file = open(log_path, 'w', newline='') if log_path else None
+         self.log = csv.writer(self.file) if self.file else None
+-        self._write('time', 'event', 'rule', 'dropped_packets', 'active_rules')
++        self._write('time', 'event', 'rule', 'class', 'dropped_packets', 'active_rules')
+ 
+     def _write(self, *row):
+         if self.log:
+@@ -74,37 +77,44 @@ class Mitigator:
+         return [_ip(src), int(sport).to_bytes(2, 'big'), _ip(dst),
+                 int(dport).to_bytes(2, 'big'), int(proto).to_bytes(1, 'big')]
+ 
+-    def update(self, flows=(), predictions=()):
+-        """Call once per round, also when the round is empty (to expire rules)."""
++    def update(self, flows=(), predictions=(), classes=None):
++        """Call once per round, also when the round is empty (to expire rules).
++        classes: optional attack type per flow, only used for logging."""
+         now = self.clock()
+-        for rule, (handle, t0) in list(self.rules.items()):
++        for rule, (handle, t0, cls) in list(self.rules.items()):
+             if now - t0 >= self.timeout:
+-                self._remove(rule, handle, now, 'expire')
+-        for flow, malicious in zip(flows, predictions):
+-            rule = self._rule(flow) if malicious else None
+-            if rule is None or rule in self.rules:
++                self._remove(rule, handle, cls, now, 'expire')
++        if classes is None:
++            classes = ['ddos'] * len(predictions)
++        flagged = [(self._rule(f), c) for f, p, c in zip(flows, predictions, classes) if p]
++        flagged = [(rule, c) for rule, c in flagged if rule is not None]
++        per_source = {}
++        for rule, _ in flagged:
++            per_source[rule[0]] = per_source.get(rule[0], 0) + 1
++        for rule, cls in flagged:
++            if rule in self.rules or per_source[rule[0]] < self.min_flows:
+                 continue
+             try:
+                 handle = self.tables.add(self.table, self._encode(rule))
+             except Exception as e:  # e.g. table full: keep detecting
+-                self._write(now, 'error', rule, repr(e), len(self.rules))
++                self._write(now, 'error', rule, cls, repr(e), len(self.rules))
+                 continue
+-            self.rules[rule] = (handle, now)
+-            self._write(now, 'block', rule, 0, len(self.rules))
++            self.rules[rule] = (handle, now, cls)
++            self._write(now, 'block', rule, cls, 0, len(self.rules))
+ 
+-    def _remove(self, rule, handle, now, event):
++    def _remove(self, rule, handle, cls, now, event):
+         dropped = -1
+         try:
+             dropped = self.tables.dropped(self.table, handle)
+             self.tables.delete(self.table, handle)
+         except Exception as e:
+-            self._write(now, 'error', rule, repr(e), len(self.rules))
++            self._write(now, 'error', rule, cls, repr(e), len(self.rules))
+             return
+         del self.rules[rule]
+-        self._write(now, event, rule, dropped, len(self.rules))
++        self._write(now, event, rule, cls, dropped, len(self.rules))
+ 
+     def close(self):
+         """Remove every rule and log how many packets each one dropped."""
+         now = self.clock()
+-        for rule, (handle, _) in list(self.rules.items()):
+-            self._remove(rule, handle, now, 'close')
++        for rule, (handle, _, cls) in list(self.rules.items()):
++            self._remove(rule, handle, cls, now, 'close')
+diff --git a/control-plane/util_functions.py b/control-plane/util_functions.py
+index 7c76e30..0d0bfd4 100644
+--- a/control-plane/util_functions.py
++++ b/control-plane/util_functions.py
+@@ -117,14 +117,36 @@ def find_min_max(X,time_window=10):
+ 
+     return min_array,max_array
+ 
+-def normalize_and_padding(X,mins,maxs,max_flow_len,padding=True):
++# Multi-class extension: categorical fields become bits, lengths are log-scaled.
++# Input: the 9 p4-compatible columns (timestamp, packet_length, IP_flags, TCP_length,
++# TCP_ack, TCP_flags, TCP_window_size, UDP_length, ICMP_type), raw values.
++RICH_FEATURES = 20
++
++def rich_features(sample, time_window):
++    s = np.asarray(sample, dtype=np.float64)
++    if s.shape[1] != 9:
++        raise ValueError("rich features need the 9 p4-compatible features")
++    log16 = np.log(65536.0)
++    cols = [s[:, 0] / time_window]                                   # time since first packet
++    cols += [np.log1p(s[:, j]) / log16 for j in (1, 3, 6, 7)]        # pkt, TCP, window, UDP length
++    cols.append((s[:, 4] > 0).astype(float))                        # ACK number set (raw value is noise)
++    cols.append(s[:, 8] / 255.0)                                     # ICMP type
++    cols += [((s[:, 5].astype(np.int64) >> b) & 1).astype(float) for b in range(9)]  # TCP flags
++    cols += [((s[:, 2].astype(np.int64) >> b) & 1).astype(float) for b in range(3)]  # IP flags (MF, DF, reserved)
++    cols.append((s[:, 1] > 0).astype(float))                        # real packet (padding rows stay 0)
++    return np.stack(cols, axis=1)
++
++def normalize_and_padding(X,mins,maxs,max_flow_len,padding=True,feature_set='lucid',time_window=TIME_WINDOW):
+     norm_X = []
+     for sample in X:
+         if sample.shape[0] > max_flow_len: # if the sample is bigger than expected, we cut the sample
+             sample = sample[:max_flow_len,...]
+         packet_nr = sample.shape[0] # number of packets in one sample
+ 
+-        norm_sample = scale_linear_bycolumn(sample, mins, maxs, high=1.0, low=0.0)
++        if feature_set == 'rich':
++            norm_sample = rich_features(sample, time_window)
++        else:
++            norm_sample = scale_linear_bycolumn(sample, mins, maxs, high=1.0, low=0.0)
+         np.nan_to_num(norm_sample, copy=False)  # remove NaN from the array
+         if padding == True:
+             norm_sample = np.pad(norm_sample, ((0, max_flow_len - packet_nr), (0, 0)), 'constant',constant_values=(0, 0))  # padding
